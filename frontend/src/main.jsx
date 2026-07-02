@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { FileText, History, MessageSquare, Search, Send, UploadCloud } from 'lucide-react';
 import './styles.css';
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000';
+const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000';
 
 function App() {
   const [documents, setDocuments] = useState([]);
@@ -204,4 +204,3 @@ function App() {
 }
 
 createRoot(document.getElementById('root')).render(<App />);
-
