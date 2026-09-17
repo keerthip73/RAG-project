@@ -46,6 +46,20 @@ def save_vector_store(store: FAISS) -> None:
     store.save_local(str(_index_path()))
 
 
+def remove_document_vectors(document_id: int) -> None:
+    store = load_vector_store()
+    if store is None:
+        return
+    ids = []
+    for vector_id in store.index_to_docstore_id.values():
+        document = store.docstore.search(vector_id)
+        if isinstance(document, LCDocument) and document.metadata.get("document_id") == document_id:
+            ids.append(vector_id)
+    if ids:
+        store.delete(ids)
+        save_vector_store(store)
+
+
 def index_pdf(file_path: Path, document_id: int, filename: str) -> int:
     loader = PyPDFLoader(str(file_path))
     pages = loader.load()

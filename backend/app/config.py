@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     gemini_embedding_model: str = "models/gemini-embedding-001"
     gemini_embedding_batch_size: int = 80
     gemini_embedding_pause_seconds: int = 65
-    cors_origins: str = "http://localhost:5173"
+    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     data_dir: Path = Path("./data")
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")

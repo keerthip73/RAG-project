@@ -21,7 +21,7 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 copy .env.example .env
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --reload --reload-dir app --port 8000
 ```
 
 Set either OpenAI or Gemini keys in `backend/.env`.
@@ -44,4 +44,7 @@ Open the Vite URL, usually `http://localhost:5173`.
 - Ask questions across all documents or a selected document
 - Receive AI answers with document/page citations
 - Persist chat history in SQLite
+- Delete a document and its indexed chunks
+- Clear chat history for the selected document or all documents
+- Download the visible chat transcript as text
 
