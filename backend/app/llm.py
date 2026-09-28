@@ -1,4 +1,5 @@
 from time import sleep
+from threading import Lock
 
 from langchain_core.embeddings import Embeddings
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
@@ -8,6 +9,8 @@ from app.config import get_settings
 
 
 class RateLimitedEmbeddings(Embeddings):
+    _request_lock = Lock()
+
     def __init__(self, wrapped: Embeddings, batch_size: int, pause_seconds: int):
         self.wrapped = wrapped
         self.batch_size = batch_size
@@ -17,13 +20,24 @@ class RateLimitedEmbeddings(Embeddings):
         embeddings: list[list[float]] = []
         for start in range(0, len(texts), self.batch_size):
             batch = texts[start : start + self.batch_size]
-            embeddings.extend(self.wrapped.embed_documents(batch))
-            if start + self.batch_size < len(texts):
-                sleep(self.pause_seconds)
+            with self._request_lock:
+                embeddings.extend(self._retry(lambda: self.wrapped.embed_documents(batch)))
+                if start + self.batch_size < len(texts):
+                    sleep(self.pause_seconds)
         return embeddings
 
     def embed_query(self, text: str) -> list[float]:
-        return self.wrapped.embed_query(text)
+        with self._request_lock:
+            return self._retry(lambda: self.wrapped.embed_query(text))
+
+    def _retry(self, request):
+        try:
+            return request()
+        except Exception as exc:
+            if "429" not in str(exc) and "ResourceExhausted" not in type(exc).__name__:
+                raise
+            sleep(self.pause_seconds)
+            return request()
 
 
 def get_embeddings():

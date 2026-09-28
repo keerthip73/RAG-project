@@ -1,17 +1,20 @@
+import json
 import logging
+import zipfile
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.database import ChatMessage, Document, get_db, init_db
-from app.rag import answer_question, index_pdf, remove_document_vectors, unique_upload_path
-from app.schemas import ChatMessageOut, ChatRequest, ChatResponse, DocumentOut, SourceOut
+from app.database import ChatMessage, Conversation, Document, SessionLocal, get_db, init_db
+from app.rag import answer_general, answer_question, index_document, remove_document_vectors, unique_upload_path
+from app.schemas import ChatMessageOut, ChatRequest, ChatResponse, ConversationCreate, ConversationOut, DocumentOut, SourceOut
 
 settings = get_settings()
-app = FastAPI(title="RAG Document Chatbot", version="0.1.0")
+app = FastAPI(title="RAG Document Chatbot", version="0.2.0")
 logger = logging.getLogger(__name__)
 
 app.add_middleware(
@@ -33,30 +36,66 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/documents", response_model=DocumentOut)
-async def upload_document(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+def process_document(document_id: int) -> None:
+    with SessionLocal() as db:
+        document = db.get(Document, document_id)
+        if document is None:
+            return
+        document.status = "processing"
+        db.commit()
+        try:
+            document.chunk_count = index_document(Path(document.stored_path), document.id, document.filename)
+            document.status = "ready"
+            document.error = None
+        except Exception as exc:
+            logger.exception("Document indexing failed for %s", document_id)
+            document.status = "failed"
+            document.error = (
+                "Gemini quota reached. Retry indexing in a minute."
+                if "429" in str(exc) or "ResourceExhausted" in type(exc).__name__
+                else "No readable text found. Scanned PDFs need OCR before indexing."
+                if isinstance(exc, ValueError) and "No readable text found" in str(exc)
+                else "Indexing failed. Check the backend logs, then retry."
+            )
+        db.commit()
 
+
+@app.post("/documents", response_model=DocumentOut, status_code=202)
+async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".pdf", ".docx", ".txt"}:
+        raise HTTPException(status_code=400, detail="Upload a PDF, Word (.docx), or text (.txt) file")
     path = unique_upload_path(file.filename)
-    content = await file.read()
-    path.write_bytes(content)
+    size = 0
+    try:
+        with path.open("wb") as destination:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > settings.max_upload_mb * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail=f"File exceeds {settings.max_upload_mb} MB")
+                destination.write(chunk)
+        if not size:
+            raise HTTPException(status_code=400, detail="File is empty")
+        if suffix == ".pdf":
+            with path.open("rb") as uploaded:
+                if uploaded.read(5) != b"%PDF-":
+                    raise HTTPException(status_code=400, detail="File is not a valid PDF")
+        if suffix == ".docx" and not zipfile.is_zipfile(path):
+            raise HTTPException(status_code=400, detail="File is not a valid Word document")
+        if suffix == ".txt":
+            path.read_text(encoding="utf-8-sig")
+    except HTTPException:
+        path.unlink(missing_ok=True)
+        raise
+    except (OSError, UnicodeError) as exc:
+        path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Could not read this file") from exc
 
-    document = Document(filename=file.filename, stored_path=str(path), chunk_count=0)
+    document = Document(filename=file.filename, stored_path=str(path), chunk_count=0, status="pending")
     db.add(document)
     db.commit()
     db.refresh(document)
-
-    try:
-        document.chunk_count = index_pdf(path, document.id, document.filename)
-        db.commit()
-        db.refresh(document)
-    except Exception as exc:
-        db.delete(document)
-        db.commit()
-        path.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
+    background_tasks.add_task(process_document, document.id)
     return document
 
 
@@ -65,18 +104,86 @@ def list_documents(db: Session = Depends(get_db)):
     return db.query(Document).order_by(Document.created_at.desc()).all()
 
 
+@app.post("/documents/{document_id}/retry", response_model=DocumentOut, status_code=202)
+def retry_document(document_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if document.status != "failed":
+        raise HTTPException(status_code=409, detail="Only failed documents can be retried")
+    document.status = "pending"
+    document.error = None
+    db.commit()
+    db.refresh(document)
+    background_tasks.add_task(process_document, document_id)
+    return document
+
+
+@app.get("/documents/{document_id}/file")
+def view_document(document_id: int, db: Session = Depends(get_db)):
+    document = db.get(Document, document_id)
+    if document is None or not Path(document.stored_path).is_file():
+        raise HTTPException(status_code=404, detail="Document not found")
+    media_type = {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".txt": "text/plain",
+    }[Path(document.filename).suffix.lower()]
+    return FileResponse(document.stored_path, media_type=media_type, filename=document.filename, content_disposition_type="inline")
+
+
 @app.delete("/documents/{document_id}", status_code=204)
 def delete_document(document_id: int, db: Session = Depends(get_db)):
     document = db.get(Document, document_id)
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
-
-    remove_document_vectors(document_id)
-    db.query(ChatMessage).filter(ChatMessage.document_id == document_id).delete()
+    if document.status in {"pending", "processing"}:
+        raise HTTPException(status_code=409, detail="Wait for indexing to finish before deleting this document")
+    if document.chunk_count:
+        remove_document_vectors(document_id)
+    conversation_ids = [row[0] for row in db.query(Conversation.id).filter(Conversation.document_id == document_id).all()]
+    if conversation_ids:
+        db.query(ChatMessage).filter(ChatMessage.conversation_id.in_(conversation_ids)).delete(synchronize_session=False)
+        db.query(Conversation).filter(Conversation.id.in_(conversation_ids)).delete(synchronize_session=False)
+    db.query(ChatMessage).filter(ChatMessage.document_id == document_id).delete(synchronize_session=False)
     stored_path = document.stored_path
     db.delete(document)
     db.commit()
     Path(stored_path).unlink(missing_ok=True)
+
+
+def _validate_mode(mode: str) -> None:
+    if mode not in {"documents", "general"}:
+        raise HTTPException(status_code=400, detail="Mode must be documents or general")
+
+
+@app.get("/conversations", response_model=list[ConversationOut])
+def list_conversations(db: Session = Depends(get_db)):
+    return db.query(Conversation).order_by(Conversation.created_at.desc(), Conversation.id.desc()).all()
+
+
+@app.post("/conversations", response_model=ConversationOut)
+def create_conversation(request: ConversationCreate, db: Session = Depends(get_db)):
+    _validate_mode(request.mode)
+    if request.mode == "general" and request.document_id is not None:
+        raise HTTPException(status_code=400, detail="General chat cannot select a document")
+    if request.document_id is not None and db.get(Document, request.document_id) is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    conversation = Conversation(title="New chat", mode=request.mode, document_id=request.document_id)
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+    return conversation
+
+
+@app.delete("/conversations/{conversation_id}", status_code=204)
+def delete_conversation(conversation_id: int, db: Session = Depends(get_db)):
+    conversation = db.get(Conversation, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    db.query(ChatMessage).filter(ChatMessage.conversation_id == conversation_id).delete()
+    db.delete(conversation)
+    db.commit()
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -84,23 +191,36 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
     question = request.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question is required")
+    conversation = db.get(Conversation, request.conversation_id) if request.conversation_id else None
+    if request.conversation_id and conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    mode = conversation.mode if conversation else request.mode
+    document_id = conversation.document_id if conversation else request.document_id
+    _validate_mode(mode)
+    if mode == "general" and document_id is not None:
+        raise HTTPException(status_code=400, detail="General chat cannot select a document")
+    if document_id is not None:
+        document = db.get(Document, document_id)
+        if document is None or document.status != "ready":
+            raise HTTPException(status_code=400, detail="Selected document is not ready")
 
-    if request.document_id is not None:
-        exists = db.query(Document).filter(Document.id == request.document_id).first()
-        if exists is None:
-            raise HTTPException(status_code=404, detail="Document not found")
+    recent = (
+        db.query(ChatMessage).filter(ChatMessage.conversation_id == conversation.id)
+        .order_by(ChatMessage.id.desc()).limit(6).all()
+        if conversation else []
+    )
+    history = "\n".join(f"{message.role}: {message.content[:1000]}" for message in reversed(recent))
 
-    db.add(ChatMessage(document_id=request.document_id, role="user", content=question))
     try:
-        answer, docs = answer_question(question, document_id=request.document_id)
+        if mode == "general":
+            answer, docs = answer_general(question, history=history), []
+        else:
+            answer, docs = answer_question(question, document_id=document_id, history=history)
     except Exception as exc:
-        db.rollback()
         logger.exception("Chat request failed")
         if "429" in str(exc) or "ResourceExhausted" in type(exc).__name__:
             raise HTTPException(status_code=429, detail="Gemini rate limit reached. Please retry shortly.") from exc
         raise HTTPException(status_code=502, detail="The AI service could not complete the request. Check the backend logs.") from exc
-    db.add(ChatMessage(document_id=request.document_id, role="assistant", content=answer))
-    db.commit()
 
     sources = [
         SourceOut(
@@ -111,22 +231,44 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
         )
         for doc in docs
     ]
-    return ChatResponse(answer=answer, sources=sources)
+    if conversation is None:
+        conversation = Conversation(title=question[:80], mode=mode, document_id=document_id)
+        db.add(conversation)
+        db.flush()
+    elif conversation.title == "New chat":
+        conversation.title = question[:80]
+    db.add_all([
+        ChatMessage(document_id=document_id, conversation_id=conversation.id, role="user", content=question),
+        ChatMessage(document_id=document_id, conversation_id=conversation.id, role="assistant", content=answer, sources_json=json.dumps([source.model_dump() for source in sources])),
+    ])
+    db.commit()
+    return ChatResponse(answer=answer, sources=sources, conversation_id=conversation.id)
 
 
 @app.get("/history", response_model=list[ChatMessageOut])
-def chat_history(document_id: int | None = None, db: Session = Depends(get_db)):
+def chat_history(conversation_id: int | None = None, document_id: int | None = None, db: Session = Depends(get_db)):
     query = db.query(ChatMessage)
-    if document_id is not None:
+    if conversation_id is not None:
+        query = query.filter(ChatMessage.conversation_id == conversation_id)
+    elif document_id is not None:
         query = query.filter(ChatMessage.document_id == document_id)
-    return query.order_by(ChatMessage.created_at.asc()).limit(200).all()
+    rows = query.order_by(ChatMessage.id.desc()).limit(200).all()
+    return [
+        ChatMessageOut(
+            id=row.id, document_id=row.document_id, conversation_id=row.conversation_id,
+            role=row.role, content=row.content, created_at=row.created_at,
+            sources=json.loads(row.sources_json or "[]"),
+        )
+        for row in reversed(rows)
+    ]
 
 
 @app.delete("/history", status_code=204)
-def clear_chat_history(document_id: int | None = None, db: Session = Depends(get_db)):
+def clear_chat_history(conversation_id: int | None = None, document_id: int | None = None, db: Session = Depends(get_db)):
     query = db.query(ChatMessage)
-    if document_id is not None:
+    if conversation_id is not None:
+        query = query.filter(ChatMessage.conversation_id == conversation_id)
+    elif document_id is not None:
         query = query.filter(ChatMessage.document_id == document_id)
     query.delete(synchronize_session=False)
     db.commit()
-

@@ -25,6 +25,8 @@ textarea {
 }
 
 .sidebar {
+  height: 100vh;
+  overflow-y: auto;
   background: #f8faf9;
   border-right: 1px solid #d7dfdf;
   padding: 24px;
@@ -67,6 +69,7 @@ textarea {
 }
 
 .upload-button,
+.new-chat-button,
 .composer button {
   border: 0;
   background: #116466;
@@ -81,6 +84,7 @@ textarea {
 }
 
 .upload-button:disabled,
+.new-chat-button:disabled,
 .composer button:disabled {
   cursor: not-allowed;
   opacity: 0.65;
@@ -341,6 +345,8 @@ details p {
   }
 
   .sidebar {
+    height: auto;
+    max-height: 48vh;
     border-right: 0;
     border-bottom: 1px solid #d7dfdf;
   }
@@ -371,4 +377,84 @@ details p {
   .composer {
     padding: 14px;
   }
+}
+
+.new-chat-button { background: #243c48; }
+
+.mode-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border: 1px solid #c7d2d4;
+  border-radius: 8px;
+  overflow: hidden;
+  background: white;
+}
+
+.mode-switch button {
+  border: 0;
+  background: transparent;
+  padding: 10px 5px;
+  color: #38545a;
+  cursor: pointer;
+}
+
+.mode-switch button.active {
+  background: #d6ece8;
+  color: #074b4d;
+  font-weight: 700;
+}
+
+.activity { margin: 0; color: #38545a; font-size: 13px; }
+select:disabled { opacity: 0.55; }
+.document-action { border-color: transparent; margin-right: 3px; }
+.document-row .failure { color: #a44230; }
+.document-select:disabled { cursor: default; }
+
+.conversations-panel {
+  border-top: 1px solid #d7dfdf;
+  padding-top: 18px;
+}
+
+.conversation-list { display: grid; gap: 4px; }
+
+.conversation-row {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  border-radius: 6px;
+}
+
+.conversation-row.active { background: #d6ece8; }
+
+.conversation-select {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  border: 0;
+  background: transparent;
+  color: #172026;
+  text-align: left;
+  padding: 9px;
+  cursor: pointer;
+}
+
+.conversation-select span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-select small { color: #607175; }
+.conversation-delete { border: 0; background: transparent; }
+
+details a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 7px;
+  color: #116466;
+  font-size: 13px;
+  font-weight: 700;
+  text-decoration: none;
 }
