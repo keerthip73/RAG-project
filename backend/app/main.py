@@ -31,9 +31,26 @@ def on_startup() -> None:
     init_db()
 
 
+def configuration_error() -> str | None:
+    provider = settings.llm_provider.lower()
+    if provider == "gemini" and not settings.gemini_api_key:
+        return "GEMINI_API_KEY is missing. Add a new Gemini key to backend/.env, then restart the backend."
+    if provider == "openai" and not settings.openai_api_key:
+        return "OPENAI_API_KEY is missing. Add it to backend/.env, or set LLM_PROVIDER=gemini and add GEMINI_API_KEY."
+    if provider not in {"gemini", "openai"}:
+        return "LLM_PROVIDER must be either gemini or openai."
+    return None
+
+
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, str | bool | None]:
+    error = configuration_error()
+    return {
+        "status": "ok",
+        "provider": settings.llm_provider.lower(),
+        "ai_ready": error is None,
+        "configuration_error": error,
+    }
 
 
 def process_document(document_id: int) -> None:
@@ -51,6 +68,9 @@ def process_document(document_id: int) -> None:
             logger.exception("Document indexing failed for %s", document_id)
             document.status = "failed"
             document.error = (
+                str(exc)
+                if isinstance(exc, RuntimeError) and "API_KEY" in str(exc)
+                else
                 "Gemini quota reached. Retry indexing in a minute."
                 if "429" in str(exc) or "ResourceExhausted" in type(exc).__name__
                 else "No readable text found. Scanned PDFs need OCR before indexing."
@@ -218,6 +238,8 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
             answer, docs = answer_question(question, document_id=document_id, history=history)
     except Exception as exc:
         logger.exception("Chat request failed")
+        if isinstance(exc, RuntimeError) and ("API_KEY" in str(exc) or "LLM_PROVIDER" in str(exc)):
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         if "429" in str(exc) or "ResourceExhausted" in type(exc).__name__:
             raise HTTPException(status_code=429, detail="Gemini rate limit reached. Please retry shortly.") from exc
         raise HTTPException(status_code=502, detail="The AI service could not complete the request. Check the backend logs.") from exc

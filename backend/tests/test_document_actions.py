@@ -103,6 +103,13 @@ class DocumentActionsTest(unittest.TestCase):
         with self.session_factory() as session:
             self.assertEqual(session.query(ChatMessage).count(), 0)
 
+    def test_missing_api_key_returns_actionable_error(self):
+        with patch("app.main.answer_question", side_effect=RuntimeError("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")):
+            response = self.client.post("/chat", json={"question": "What is DDL?"})
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("GEMINI_API_KEY", response.json()["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -46,7 +46,13 @@ function App() {
     return rows;
   }
 
+  async function checkHealth() {
+    const health = await api('/health');
+    if (!health.ai_ready) setError(health.configuration_error);
+  }
+
   useEffect(() => {
+    checkHealth().catch((err) => setError(err.message));
     refreshDocuments().catch((err) => setError(err.message));
     refreshConversations().then((rows) => {
       if (rows.length) {

@@ -55,12 +55,14 @@ def get_embeddings():
             batch_size=settings.gemini_embedding_batch_size,
             pause_seconds=settings.gemini_embedding_pause_seconds,
         )
-    if not settings.openai_api_key:
-        raise RuntimeError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
-    return OpenAIEmbeddings(
-        model=settings.openai_embedding_model,
-        api_key=settings.openai_api_key,
-    )
+    if provider == "openai":
+        if not settings.openai_api_key:
+            raise RuntimeError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
+        return OpenAIEmbeddings(
+            model=settings.openai_embedding_model,
+            api_key=settings.openai_api_key,
+        )
+    raise RuntimeError("LLM_PROVIDER must be either gemini or openai")
 
 
 def get_chat_model():
@@ -74,10 +76,12 @@ def get_chat_model():
             google_api_key=settings.gemini_api_key,
             temperature=0.2,
         )
-    if not settings.openai_api_key:
-        raise RuntimeError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
-    return ChatOpenAI(
-        model=settings.openai_model,
-        api_key=settings.openai_api_key,
-        temperature=0.2,
-    )
+    if provider == "openai":
+        if not settings.openai_api_key:
+            raise RuntimeError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
+        return ChatOpenAI(
+            model=settings.openai_model,
+            api_key=settings.openai_api_key,
+            temperature=0.2,
+        )
+    raise RuntimeError("LLM_PROVIDER must be either gemini or openai")
