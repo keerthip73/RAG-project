@@ -65,7 +65,7 @@ The root `vercel.json` uses Vercel Services to deploy the Vite frontend and Fast
 
 1. Import this GitHub repository into Vercel. Keep the project root at the repository root; do not select `frontend` or `backend` as the root directory.
 2. Add a Neon Postgres integration to the project. It injects `DATABASE_URL` automatically.
-3. Add a private Vercel Blob store to the same project. It injects `BLOB_READ_WRITE_TOKEN` automatically.
+3. Add a private Vercel Blob store to the same project. Keep the read-write-token option disabled; the app uses Vercel OIDC with the injected `BLOB_STORE_ID`.
 4. Add these project environment variables for Production, Preview, and Development:
 
 ```text
@@ -77,5 +77,5 @@ GEMINI_EMBEDDING_MODEL=models/gemini-embedding-001
 
 5. Deploy, then open `/api/health` on the deployment. It should return `"ai_ready": true`.
 
-Never use a Gemini key that has been pasted into chat or committed anywhere; create a new key for deployment. Never put `GEMINI_API_KEY`, `DATABASE_URL`, or `BLOB_READ_WRITE_TOKEN` in a `VITE_*` variable because Vite variables are public browser code. This app does not yet provide user accounts, so upload only non-sensitive demonstration documents to a public deployment.
+Never use a Gemini key that has been pasted into chat or committed anywhere; create a new key for deployment. Never put `GEMINI_API_KEY`, `DATABASE_URL`, or Blob credentials in a `VITE_*` variable because Vite variables are public browser code. This app does not yet provide user accounts, so upload only non-sensitive demonstration documents to a public deployment.
 

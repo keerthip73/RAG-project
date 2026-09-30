@@ -43,8 +43,8 @@ def on_startup() -> None:
 def configuration_error() -> str | None:
     if settings.is_vercel and not settings.database_url:
         return "DATABASE_URL is missing. Connect a Neon Postgres database to the backend Vercel project."
-    if settings.is_vercel and not settings.blob_read_write_token:
-        return "BLOB_READ_WRITE_TOKEN is missing. Connect a private Vercel Blob store to the backend project."
+    if settings.is_vercel and not settings.blob_configured:
+        return "BLOB_STORE_ID is missing. Connect a private Vercel Blob store to this project."
     provider = settings.llm_provider.lower()
     if provider == "gemini" and not settings.gemini_api_key:
         return "GEMINI_API_KEY is missing. Add a new Gemini key to backend/.env, then restart the backend."
@@ -138,7 +138,7 @@ async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = 
 
     storage_kind = "local"
     stored_path = str(path)
-    if settings.blob_read_write_token:
+    if settings.blob_configured:
         try:
             stored_path = await upload_blob(path, file.filename)
             storage_kind = "blob"

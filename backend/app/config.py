@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     cors_origin_regex: str | None = None
     database_url: str | None = None
     blob_read_write_token: str | None = None
+    blob_store_id: str | None = None
     data_dir: Path = Path("/tmp/data") if os.getenv("VERCEL") else Path("./data")
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
@@ -44,6 +45,10 @@ class Settings(BaseSettings):
     def upload_limit_mb(self) -> int:
         # Vercel Functions reject request bodies larger than 4.5 MB, including multipart overhead.
         return min(self.max_upload_mb, 4) if self.is_vercel else self.max_upload_mb
+
+    @property
+    def blob_configured(self) -> bool:
+        return bool(self.blob_read_write_token or (self.is_vercel and self.blob_store_id))
 
 
 @lru_cache
