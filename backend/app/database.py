@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, inspect, text
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 from app.config import get_settings
@@ -16,6 +16,7 @@ class Document(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     stored_path: Mapped[str] = mapped_column(Text, nullable=False)
+    storage_kind: Mapped[str] = mapped_column(String(20), default="local", nullable=False)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="ready", nullable=False)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -30,6 +31,18 @@ class Conversation(Base):
     mode: Mapped[str] = mapped_column(String(20), default="documents", nullable=False)
     document_id: Mapped[int | None] = mapped_column(ForeignKey("documents.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class DocumentChunk(Base):
+    __tablename__ = "document_chunks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id"), nullable=False, index=True)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    page: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    embedding_norm: Mapped[float] = mapped_column(Float, nullable=False)
 
 
 class ChatMessage(Base):
@@ -47,18 +60,30 @@ class ChatMessage(Base):
 
 
 settings = get_settings()
-engine = create_engine(f"sqlite:///{settings.db_path}", connect_args={"check_same_thread": False})
+database_url = settings.database_url or f"sqlite:///{settings.db_path}"
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql+psycopg://", 1)
+elif database_url.startswith("postgresql://"):
+    database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+engine_options = {"pool_pre_ping": True}
+if database_url.startswith("sqlite"):
+    engine_options["connect_args"] = {"check_same_thread": False}
+engine = create_engine(database_url, **engine_options)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    if engine.dialect.name != "sqlite":
+        return
     with engine.begin() as connection:
         columns = {column["name"] for column in inspect(connection).get_columns("documents")}
         if "status" not in columns:
             connection.execute(text("ALTER TABLE documents ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'ready'"))
         if "error" not in columns:
             connection.execute(text("ALTER TABLE documents ADD COLUMN error TEXT"))
+        if "storage_kind" not in columns:
+            connection.execute(text("ALTER TABLE documents ADD COLUMN storage_kind VARCHAR(20) NOT NULL DEFAULT 'local'"))
         columns = {column["name"] for column in inspect(connection).get_columns("chat_messages")}
         if "conversation_id" not in columns:
             connection.execute(text("ALTER TABLE chat_messages ADD COLUMN conversation_id INTEGER"))

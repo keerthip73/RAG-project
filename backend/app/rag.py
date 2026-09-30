@@ -1,15 +1,17 @@
+from array import array
+from math import sqrt
 from pathlib import Path
 from uuid import uuid4
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.docstore.in_memory import InMemoryDocstore
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document as LCDocument
 from langchain_core.prompts import ChatPromptTemplate
 from docx import Document as WordDocument
+from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.database import DocumentChunk
 from app.llm import get_chat_model, get_embeddings
 
 
@@ -36,40 +38,25 @@ GENERAL_PROMPT = ChatPromptTemplate.from_messages(
 )
 
 
-def _index_path() -> Path:
-    return get_settings().index_dir
+def _pack_embedding(values: list[float]) -> bytes:
+    return array("f", values).tobytes()
 
 
-def load_vector_store() -> FAISS | None:
-    path = _index_path()
-    if not (path / "index.faiss").exists():
-        return None
-    return FAISS.load_local(
-        str(path),
-        get_embeddings(),
-        allow_dangerous_deserialization=True,
-    )
+def _unpack_embedding(value: bytes) -> array:
+    unpacked = array("f")
+    unpacked.frombytes(value)
+    return unpacked
 
 
-def save_vector_store(store: FAISS) -> None:
-    store.save_local(str(_index_path()))
+def _norm(values) -> float:
+    return sqrt(sum(value * value for value in values))
 
 
-def remove_document_vectors(document_id: int) -> None:
-    store = load_vector_store()
-    if store is None:
-        return
-    ids = []
-    for vector_id in store.index_to_docstore_id.values():
-        document = store.docstore.search(vector_id)
-        if isinstance(document, LCDocument) and document.metadata.get("document_id") == document_id:
-            ids.append(vector_id)
-    if ids:
-        store.delete(ids)
-        save_vector_store(store)
+def remove_document_vectors(document_id: int, db: Session) -> None:
+    db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).delete(synchronize_session=False)
 
 
-def index_document(file_path: Path, document_id: int, filename: str) -> int:
+def index_document(file_path: Path, document_id: int, filename: str, db: Session) -> int:
     suffix = file_path.suffix.lower()
     if suffix == ".pdf":
         pages = PyPDFLoader(str(file_path)).load()
@@ -97,27 +84,55 @@ def index_document(file_path: Path, document_id: int, filename: str) -> int:
             }
         )
 
-    store = load_vector_store()
-    if store is None:
-        store = FAISS.from_documents(chunks, get_embeddings())
-    else:
-        store.add_documents(chunks)
-    save_vector_store(store)
+    vectors = get_embeddings().embed_documents([chunk.page_content for chunk in chunks])
+    remove_document_vectors(document_id, db)
+    db.add_all(
+        DocumentChunk(
+            document_id=document_id,
+            filename=filename,
+            page=chunk.metadata.get("page"),
+            content=chunk.page_content,
+            embedding=_pack_embedding(vector),
+            embedding_norm=_norm(vector),
+        )
+        for chunk, vector in zip(chunks, vectors, strict=True)
+    )
+    db.flush()
     return len(chunks)
 
 
-def search_documents(question: str, document_id: int | None = None, k: int = 5) -> list[LCDocument]:
-    store = load_vector_store()
-    if store is None:
-        return []
-    options = {}
+def search_documents(question: str, db: Session, document_id: int | None = None, k: int = 5) -> list[LCDocument]:
+    query = db.query(DocumentChunk)
     if document_id is not None:
-        options = {"filter": {"document_id": document_id}, "fetch_k": store.index.ntotal}
-    return store.similarity_search(question, k=k, **options)
+        query = query.filter(DocumentChunk.document_id == document_id)
+    chunks = query.all()
+    if not chunks:
+        return []
+    question_vector = get_embeddings().embed_query(question)
+    question_norm = _norm(question_vector)
+    if not question_norm:
+        return []
+    ranked = [
+        (
+            sum(left * right for left, right in zip(question_vector, _unpack_embedding(chunk.embedding)))
+            / (question_norm * chunk.embedding_norm),
+            chunk,
+        )
+        for chunk in chunks
+        if chunk.embedding_norm
+    ]
+    ranked.sort(key=lambda item: item[0])
+    return [
+        LCDocument(
+            page_content=chunk.content,
+            metadata={"document_id": chunk.document_id, "filename": chunk.filename, "page": chunk.page},
+        )
+        for _, chunk in reversed(ranked[-k:])
+    ]
 
 
-def answer_question(question: str, document_id: int | None = None, history: str = "") -> tuple[str, list[LCDocument]]:
-    docs = search_documents(question, document_id=document_id)
+def answer_question(question: str, db: Session, document_id: int | None = None, history: str = "") -> tuple[str, list[LCDocument]]:
+    docs = search_documents(question, db=db, document_id=document_id)
     if not docs:
         return "I could not find relevant document context for that question.", []
 
@@ -132,17 +147,6 @@ def answer_question(question: str, document_id: int | None = None, history: str 
 
 def answer_general(question: str, history: str = "") -> str:
     return (GENERAL_PROMPT | get_chat_model()).invoke({"question": question, "history": history}).content
-
-
-def empty_vector_store() -> FAISS:
-    embeddings = get_embeddings()
-    index = __import__("faiss").IndexFlatL2(len(embeddings.embed_query("dimension probe")))
-    return FAISS(
-        embedding_function=embeddings,
-        index=index,
-        docstore=InMemoryDocstore(),
-        index_to_docstore_id={},
-    )
 
 
 def unique_upload_path(filename: str) -> Path:

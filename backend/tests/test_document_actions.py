@@ -9,7 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.database import Base, ChatMessage, Document, get_db
+from app.database import Base, ChatMessage, Document, DocumentChunk, get_db
 from app.main import app
 from app.rag import remove_document_vectors
 
@@ -50,10 +50,10 @@ class DocumentActionsTest(unittest.TestCase):
             session.commit()
 
         with patch("app.main.remove_document_vectors") as remove_vectors:
-            response = self.client.delete(f"/documents/{document_id}")
+            response = self.client.delete(f"/api/documents/{document_id}")
 
         self.assertEqual(response.status_code, 204)
-        remove_vectors.assert_called_once_with(document_id)
+        self.assertEqual(remove_vectors.call_args.args[0], document_id)
         self.assertFalse(pdf_path.exists())
         with self.session_factory() as session:
             self.assertIsNone(session.get(Document, document_id))
@@ -74,29 +74,31 @@ class DocumentActionsTest(unittest.TestCase):
             )
             session.commit()
 
-        response = self.client.delete(f"/history?document_id={ids[0]}")
+        response = self.client.delete(f"/api/history?document_id={ids[0]}")
         self.assertEqual(response.status_code, 204)
         with self.session_factory() as session:
             remaining = session.query(ChatMessage).all()
             self.assertEqual([message.document_id for message in remaining], [ids[1]])
 
     def test_remove_document_vectors_keeps_other_documents(self):
-        store = MagicMock()
-        store.index_to_docstore_id = {0: "first", 1: "second"}
-        store.docstore.search.side_effect = [
-            LCDocument(page_content="One", metadata={"document_id": 1}),
-            LCDocument(page_content="Two", metadata={"document_id": 2}),
-        ]
-
-        with patch("app.rag.load_vector_store", return_value=store), patch("app.rag.save_vector_store") as save:
-            remove_document_vectors(1)
-
-        store.delete.assert_called_once_with(["first"])
-        save.assert_called_once_with(store)
+        with self.session_factory() as session:
+            session.add_all([
+                Document(filename="one.pdf", stored_path="one.pdf"),
+                Document(filename="two.pdf", stored_path="two.pdf"),
+            ])
+            session.flush()
+            session.add_all([
+                DocumentChunk(document_id=1, filename="one.pdf", content="One", embedding=b"1234", embedding_norm=1),
+                DocumentChunk(document_id=2, filename="two.pdf", content="Two", embedding=b"1234", embedding_norm=1),
+            ])
+            session.commit()
+            remove_document_vectors(1, session)
+            session.commit()
+            self.assertEqual([chunk.document_id for chunk in session.query(DocumentChunk).all()], [2])
 
     def test_quota_error_does_not_save_failed_question(self):
         with patch("app.main.answer_question", side_effect=RuntimeError("429 quota exceeded")):
-            response = self.client.post("/chat", json={"question": "What is Java?"})
+            response = self.client.post("/api/chat", json={"question": "What is Java?"})
 
         self.assertEqual(response.status_code, 429)
         self.assertIn("retry", response.json()["detail"].lower())
@@ -105,7 +107,7 @@ class DocumentActionsTest(unittest.TestCase):
 
     def test_missing_api_key_returns_actionable_error(self):
         with patch("app.main.answer_question", side_effect=RuntimeError("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")):
-            response = self.client.post("/chat", json={"question": "What is DDL?"})
+            response = self.client.post("/api/chat", json={"question": "What is DDL?"})
 
         self.assertEqual(response.status_code, 503)
         self.assertIn("GEMINI_API_KEY", response.json()["detail"])

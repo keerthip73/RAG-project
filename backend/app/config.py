@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -16,7 +17,10 @@ class Settings(BaseSettings):
     gemini_embedding_pause_seconds: int = 65
     max_upload_mb: int = 20
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
-    data_dir: Path = Path("./data")
+    cors_origin_regex: str | None = None
+    database_url: str | None = None
+    blob_read_write_token: str | None = None
+    data_dir: Path = Path("/tmp/data") if os.getenv("VERCEL") else Path("./data")
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
@@ -31,6 +35,15 @@ class Settings(BaseSettings):
     @property
     def db_path(self) -> Path:
         return self.data_dir / "rag_chatbot.db"
+
+    @property
+    def is_vercel(self) -> bool:
+        return bool(os.getenv("VERCEL"))
+
+    @property
+    def upload_limit_mb(self) -> int:
+        # Vercel Functions reject request bodies larger than 4.5 MB, including multipart overhead.
+        return min(self.max_upload_mb, 4) if self.is_vercel else self.max_upload_mb
 
 
 @lru_cache

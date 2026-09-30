@@ -2,24 +2,33 @@ import json
 import logging
 import zipfile
 from pathlib import Path
+from urllib.parse import quote
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.database import ChatMessage, Conversation, Document, SessionLocal, get_db, init_db
 from app.rag import answer_general, answer_question, index_document, remove_document_vectors, unique_upload_path
 from app.schemas import ChatMessageOut, ChatRequest, ChatResponse, ConversationCreate, ConversationOut, DocumentOut, SourceOut
+from app.storage import delete_blob, download_blob, get_blob, upload_blob
 
 settings = get_settings()
-app = FastAPI(title="RAG Document Chatbot", version="0.2.0")
+app = FastAPI(
+    title="RAG Document Chatbot",
+    version="0.3.0",
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json",
+)
+api = APIRouter(prefix="/api")
 logger = logging.getLogger(__name__)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()],
+    allow_origin_regex=settings.cors_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,6 +41,10 @@ def on_startup() -> None:
 
 
 def configuration_error() -> str | None:
+    if settings.is_vercel and not settings.database_url:
+        return "DATABASE_URL is missing. Connect a Neon Postgres database to the backend Vercel project."
+    if settings.is_vercel and not settings.blob_read_write_token:
+        return "BLOB_READ_WRITE_TOKEN is missing. Connect a private Vercel Blob store to the backend project."
     provider = settings.llm_provider.lower()
     if provider == "gemini" and not settings.gemini_api_key:
         return "GEMINI_API_KEY is missing. Add a new Gemini key to backend/.env, then restart the backend."
@@ -42,7 +55,7 @@ def configuration_error() -> str | None:
     return None
 
 
-@app.get("/health")
+@api.get("/health")
 def health() -> dict[str, str | bool | None]:
     error = configuration_error()
     return {
@@ -53,7 +66,8 @@ def health() -> dict[str, str | bool | None]:
     }
 
 
-def process_document(document_id: int) -> None:
+async def process_document(document_id: int, source_path: Path | None = None) -> None:
+    temporary_path: Path | None = None
     with SessionLocal() as db:
         document = db.get(Document, document_id)
         if document is None:
@@ -61,10 +75,18 @@ def process_document(document_id: int) -> None:
         document.status = "processing"
         db.commit()
         try:
-            document.chunk_count = index_document(Path(document.stored_path), document.id, document.filename)
+            if source_path is None:
+                if document.storage_kind == "blob":
+                    temporary_path = await download_blob(document.stored_path, Path(document.filename).suffix.lower())
+                    source_path = temporary_path
+                else:
+                    source_path = Path(document.stored_path)
+            document.chunk_count = index_document(source_path, document.id, document.filename, db)
             document.status = "ready"
             document.error = None
         except Exception as exc:
+            db.rollback()
+            document = db.get(Document, document_id)
             logger.exception("Document indexing failed for %s", document_id)
             document.status = "failed"
             document.error = (
@@ -77,10 +99,13 @@ def process_document(document_id: int) -> None:
                 if isinstance(exc, ValueError) and "No readable text found" in str(exc)
                 else "Indexing failed. Check the backend logs, then retry."
             )
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
         db.commit()
 
 
-@app.post("/documents", response_model=DocumentOut, status_code=202)
+@api.post("/documents", response_model=DocumentOut, status_code=202)
 async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...), db: Session = Depends(get_db)):
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".pdf", ".docx", ".txt"}:
@@ -91,8 +116,8 @@ async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = 
         with path.open("wb") as destination:
             while chunk := await file.read(1024 * 1024):
                 size += len(chunk)
-                if size > settings.max_upload_mb * 1024 * 1024:
-                    raise HTTPException(status_code=413, detail=f"File exceeds {settings.max_upload_mb} MB")
+                if size > settings.upload_limit_mb * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail=f"File exceeds {settings.upload_limit_mb} MB")
                 destination.write(chunk)
         if not size:
             raise HTTPException(status_code=400, detail="File is empty")
@@ -111,21 +136,43 @@ async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = 
         path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="Could not read this file") from exc
 
-    document = Document(filename=file.filename, stored_path=str(path), chunk_count=0, status="pending")
+    storage_kind = "local"
+    stored_path = str(path)
+    if settings.blob_read_write_token:
+        try:
+            stored_path = await upload_blob(path, file.filename)
+            storage_kind = "blob"
+        except Exception as exc:
+            path.unlink(missing_ok=True)
+            logger.exception("Blob upload failed")
+            raise HTTPException(status_code=502, detail="Could not store the uploaded document") from exc
+
+    document = Document(
+        filename=file.filename,
+        stored_path=stored_path,
+        storage_kind=storage_kind,
+        chunk_count=0,
+        status="pending",
+    )
     db.add(document)
     db.commit()
     db.refresh(document)
-    background_tasks.add_task(process_document, document.id)
+    if storage_kind == "blob" or settings.is_vercel:
+        await process_document(document.id, path)
+        path.unlink(missing_ok=True)
+        db.refresh(document)
+    else:
+        background_tasks.add_task(process_document, document.id)
     return document
 
 
-@app.get("/documents", response_model=list[DocumentOut])
+@api.get("/documents", response_model=list[DocumentOut])
 def list_documents(db: Session = Depends(get_db)):
     return db.query(Document).order_by(Document.created_at.desc()).all()
 
 
-@app.post("/documents/{document_id}/retry", response_model=DocumentOut, status_code=202)
-def retry_document(document_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+@api.post("/documents/{document_id}/retry", response_model=DocumentOut, status_code=202)
+async def retry_document(document_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     document = db.get(Document, document_id)
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -135,41 +182,62 @@ def retry_document(document_id: int, background_tasks: BackgroundTasks, db: Sess
     document.error = None
     db.commit()
     db.refresh(document)
-    background_tasks.add_task(process_document, document_id)
+    if document.storage_kind == "blob" or settings.is_vercel:
+        await process_document(document_id)
+        db.refresh(document)
+    else:
+        background_tasks.add_task(process_document, document_id)
     return document
 
 
-@app.get("/documents/{document_id}/file")
-def view_document(document_id: int, db: Session = Depends(get_db)):
+@api.get("/documents/{document_id}/file")
+async def view_document(document_id: int, db: Session = Depends(get_db)):
     document = db.get(Document, document_id)
-    if document is None or not Path(document.stored_path).is_file():
+    if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
     media_type = {
         ".pdf": "application/pdf",
         ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         ".txt": "text/plain",
     }[Path(document.filename).suffix.lower()]
+    if document.storage_kind == "blob":
+        result, stream = await get_blob(document.stored_path)
+        if result is None or result.status_code != 200 or stream is None:
+            raise HTTPException(status_code=404, detail="Document not found")
+        return StreamingResponse(
+            stream,
+            media_type=media_type,
+            headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(document.filename)}"},
+        )
+    if not Path(document.stored_path).is_file():
+        raise HTTPException(status_code=404, detail="Document not found")
     return FileResponse(document.stored_path, media_type=media_type, filename=document.filename, content_disposition_type="inline")
 
 
-@app.delete("/documents/{document_id}", status_code=204)
-def delete_document(document_id: int, db: Session = Depends(get_db)):
+@api.delete("/documents/{document_id}", status_code=204)
+async def delete_document(document_id: int, db: Session = Depends(get_db)):
     document = db.get(Document, document_id)
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
     if document.status in {"pending", "processing"}:
         raise HTTPException(status_code=409, detail="Wait for indexing to finish before deleting this document")
-    if document.chunk_count:
-        remove_document_vectors(document_id)
+    remove_document_vectors(document_id, db)
     conversation_ids = [row[0] for row in db.query(Conversation.id).filter(Conversation.document_id == document_id).all()]
     if conversation_ids:
         db.query(ChatMessage).filter(ChatMessage.conversation_id.in_(conversation_ids)).delete(synchronize_session=False)
         db.query(Conversation).filter(Conversation.id.in_(conversation_ids)).delete(synchronize_session=False)
     db.query(ChatMessage).filter(ChatMessage.document_id == document_id).delete(synchronize_session=False)
     stored_path = document.stored_path
+    storage_kind = document.storage_kind
     db.delete(document)
     db.commit()
-    Path(stored_path).unlink(missing_ok=True)
+    if storage_kind == "blob":
+        try:
+            await delete_blob(stored_path)
+        except Exception:
+            logger.exception("Blob cleanup failed for document %s", document_id)
+    else:
+        Path(stored_path).unlink(missing_ok=True)
 
 
 def _validate_mode(mode: str) -> None:
@@ -177,12 +245,12 @@ def _validate_mode(mode: str) -> None:
         raise HTTPException(status_code=400, detail="Mode must be documents or general")
 
 
-@app.get("/conversations", response_model=list[ConversationOut])
+@api.get("/conversations", response_model=list[ConversationOut])
 def list_conversations(db: Session = Depends(get_db)):
     return db.query(Conversation).order_by(Conversation.created_at.desc(), Conversation.id.desc()).all()
 
 
-@app.post("/conversations", response_model=ConversationOut)
+@api.post("/conversations", response_model=ConversationOut)
 def create_conversation(request: ConversationCreate, db: Session = Depends(get_db)):
     _validate_mode(request.mode)
     if request.mode == "general" and request.document_id is not None:
@@ -196,7 +264,7 @@ def create_conversation(request: ConversationCreate, db: Session = Depends(get_d
     return conversation
 
 
-@app.delete("/conversations/{conversation_id}", status_code=204)
+@api.delete("/conversations/{conversation_id}", status_code=204)
 def delete_conversation(conversation_id: int, db: Session = Depends(get_db)):
     conversation = db.get(Conversation, conversation_id)
     if conversation is None:
@@ -206,7 +274,7 @@ def delete_conversation(conversation_id: int, db: Session = Depends(get_db)):
     db.commit()
 
 
-@app.post("/chat", response_model=ChatResponse)
+@api.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest, db: Session = Depends(get_db)):
     question = request.question.strip()
     if not question:
@@ -235,7 +303,7 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
         if mode == "general":
             answer, docs = answer_general(question, history=history), []
         else:
-            answer, docs = answer_question(question, document_id=document_id, history=history)
+            answer, docs = answer_question(question, db=db, document_id=document_id, history=history)
     except Exception as exc:
         logger.exception("Chat request failed")
         if isinstance(exc, RuntimeError) and ("API_KEY" in str(exc) or "LLM_PROVIDER" in str(exc)):
@@ -267,7 +335,7 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
     return ChatResponse(answer=answer, sources=sources, conversation_id=conversation.id)
 
 
-@app.get("/history", response_model=list[ChatMessageOut])
+@api.get("/history", response_model=list[ChatMessageOut])
 def chat_history(conversation_id: int | None = None, document_id: int | None = None, db: Session = Depends(get_db)):
     query = db.query(ChatMessage)
     if conversation_id is not None:
@@ -285,7 +353,7 @@ def chat_history(conversation_id: int | None = None, document_id: int | None = N
     ]
 
 
-@app.delete("/history", status_code=204)
+@api.delete("/history", status_code=204)
 def clear_chat_history(conversation_id: int | None = None, document_id: int | None = None, db: Session = Depends(get_db)):
     query = db.query(ChatMessage)
     if conversation_id is not None:
@@ -294,3 +362,6 @@ def clear_chat_history(conversation_id: int | None = None, document_id: int | No
         query = query.filter(ChatMessage.document_id == document_id)
     query.delete(synchronize_session=False)
     db.commit()
+
+
+app.include_router(api)

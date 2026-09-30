@@ -3,7 +3,9 @@ import { createRoot } from 'react-dom/client';
 import { Download, ExternalLink, FileText, History, MessageSquare, Plus, RotateCcw, Search, Send, Trash2, UploadCloud } from 'lucide-react';
 import './styles.css';
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000';
+const API_BASE = (
+  import.meta.env.VITE_API_BASE ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000/api' : '/api')
+).replace(/\/$/, '');
 
 async function api(path, options) {
   const response = await fetch(`${API_BASE}${path}`, options);
